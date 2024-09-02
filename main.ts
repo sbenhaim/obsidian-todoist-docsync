@@ -1,82 +1,353 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, TFile,
+	normalizePath, Notice,
+	TFolder
+ } from 'obsidian';
+import { TodoistApi, Project, Section, Task } from "@doist/todoist-api-typescript";
+import axios from 'axios';
+import open from 'open';
+const yaml = require('js-yaml');
+
+// Todoist Endpoints
+const BASE_URI = 'https://api.todoist.com'
+const API_REST_BASE_URI = '/rest/v2/'
+export const API_SYNC_BASE_URI = '/sync/v9/'
+const TODOIST_URI = 'https://todoist.com'
+const API_AUTHORIZATION_BASE_URI = '/oauth/'
+const DESKTOP_URL_PROTOCOL = 'todoist'
+
+function getRestBaseUri(domainBase: string = BASE_URI): string {
+    return new URL(API_REST_BASE_URI, domainBase).toString()
+}
+
+function getSyncBaseUri(domainBase: string = BASE_URI): string {
+    return new URL(API_SYNC_BASE_URI, domainBase).toString()
+}
+
+export const ENDPOINT_SYNC_QUICK_ADD = 'quick/add'
 
 // Remember to rename these classes and interfaces!
 
-interface MyPluginSettings {
-	mySetting: string;
+interface OTDSSettings {
+	key: string;
+	directory: string;
+	projectDirectory: string;
+	fileClass: string;
+	syncToken: string;
+	autoSyncFrequency: number;
+	titleFrontMatterKey: string;
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+interface QuickAddOptions {
+	due?: any;
+	project?: string;
+	priority?: number;
+	label?: string;
+	recurrence?: string;
+	description?: string;
 }
+
+const DEFAULT_SETTINGS: OTDSSettings = {
+	key: 'Todoist API key goes here.',
+	directory: 'Todo',
+	projectDirectory: 'Projects',
+	fileClass: '',
+	syncToken: '*',
+	autoSyncFrequency: 0,
+	titleFrontMatterKey: 'alias',
+}
+
 
 export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+	settings: OTDSSettings;
+	api: any;
 
 	async onload() {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
 
 		// This adds a simple command that can be triggered anywhere
 		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
+			id: 'otds-sync',
+			name: 'Sync',
 			callback: () => {
-				new SampleModal(this.app).open();
+				this.sync(true);
 			}
 		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
+		if (this.settings.autoSyncFrequency > 0) {
+			this.registerInterval(window.setInterval(() => {
+				this.sync();
+			}, this.settings.autoSyncFrequency * 1000));
+		}
+
+
+		this.addCommand({
+			id: 'otds-sync-all',
+			name: 'Sync All',
+			callback: () => {
+				this.settings.syncToken = '*';
+				this.sync(true);
 			}
 		});
+
+
+		this.addCommand({
+			id: 'otds-create-task-from-file',
+			name: 'Create Task from this File',
+			callback: async () => {
+				const file = this.app.workspace.getActiveFile();
+
+				if (! file) {
+					return;
+				}
+
+				const md = this.app.metadataCache;
+				const opts = md.getFileCache(file).frontmatter as QuickAddOptions;
+				const name = file.basename;
+
+				let fileUrl = this.obsidianUrl(file);
+
+				let contents = await this.app.vault.cachedRead(file);
+				contents = contents.replace(/^---\n.*?\n---\n/s, '').trim();
+
+				let description = fileUrl;
+
+				if (opts.description) {
+					description = opts.description + " " + description;
+				}
+
+				this.quickAdd(name, description, opts);
+
+			}
+		})
+
+		this.addCommand({
+			id: 'otds-archive-completed',
+			name: 'Archive Completed Tasks',
+			callback: async () => {
+
+				// Move all tasks to the Completed subfolder of the task folder
+				let taskFolder = normalizePath(this.settings.directory);
+				let completedFolder = normalizePath(taskFolder + '/Completed');
+
+				if (this.app.vault.getAbstractFileByPath(completedFolder) == null) {
+					this.app.vault.createFolder(normalizePath(completedFolder));
+				}
+
+				let tf:TFolder = this.app.vault.getFolderByPath(taskFolder) as TFolder;
+
+				for ( let file of tf.children ) {
+					if (file instanceof TFile) {
+
+						let fm:any = this.app.metadataCache.getFileCache(file)?.frontmatter;
+
+						if (fm && fm.completed && fm.completed !== '') {
+							this.app.vault.rename(file, normalizePath(completedFolder + '/' + file.basename));
+						}
+					}
+				}
+
+			}
+		})
 
 		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+		this.addSettingTab(new OTDSSettingTab(this.app, this));
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
 	}
+
+	async getProjects():Promise<Project[]> {
+		return this.getApi().getProjects();
+	}
+
+	async getSections():Promise<Section[]> {
+		return this.getApi().getSections();
+	}
+
+	obsidianUrl(file:TFile) {
+		// obsidian://open?vault=Corpus&file=Tasks%2FScratch
+		let path = file.path;
+		let vaultName = this.app.vault.getName();
+		return `obsidian://open?vault=${vaultName}&file=${path}`;
+	}
+
+	getApi():any {
+		if (this.api) {
+			return this.api;
+		}
+		else {
+			this.api = new TodoistApi(this.settings.key);
+			return this.api;
+		}
+	}
+
+
+	async quickAdd(name:string, description:string, options:QuickAddOptions) {
+
+		let priority = options.priority ? ` p${options.priority}` : '';
+		let project = options.project ? ` #${options.project}` : '';
+		let label = options.label ? ` @${options.label}` : '';
+		let recurrence = options.recurrence ? ` ${options.recurrence} starting` : '';
+
+		let due:string;
+
+		if (options.due) {
+			due = " " + options.due.replace(/(\d)T(\d)/, '$1 $2').replace(/(..:..):../, '$1');
+		}
+		else {
+			due = '';
+		}
+
+
+		let optStr = priority + project + label + recurrence + due;
+
+		let content = `${name} ${optStr} // ${description}`;
+
+		console.log(content);
+
+		let result:any = await axios.post(getSyncBaseUri() + ENDPOINT_SYNC_QUICK_ADD, {
+			text: content,
+			auto_reminder: true
+		}, {
+			headers: {
+				'Authorization': `Bearer ${this.settings.key}`,
+				'Content-Type': 'application/json'
+			}
+		});
+	}
+
+	async sync(notify?:boolean):Promise<any> {
+
+		if (notify) {
+			new Notice('Syncing with Todoist...');
+		}
+		else {
+			console.log('Syncing with Todoist...');
+		}
+
+		if (this.app.vault.getAbstractFileByPath(this.settings.directory) == null) {
+			this.app.vault.createFolder(normalizePath(this.settings.directory));
+		}
+
+		if (notify) {
+			new Notice('Fetching Projects...');
+		}
+		else {
+			console.log('Fetching Projects...');
+		}
+
+		const projects:Project[] = await this.getProjects();
+
+		const projectMap: { [id:string]: Project } = projects.reduce((map, project) => {
+			map[project.id] = project;
+			return map;
+		}, {} as { [id:string]: Project });
+
+
+		if (notify) {
+			new Notice('Fetching Sections...');
+		}
+		else {
+			console.log('Fetching Sections...');
+		}
+
+		const sections:Section[] = await this.getSections();
+		const sectionMap: { [id:string]: Section } = sections.reduce((map, section) => {
+			map[section.id] = section;
+			return map;
+		}, {} as { [id:string]: Section });
+
+		console.log("Project Map:", projectMap);
+		console.log("Section Map:", sectionMap);
+
+		console.log( "Sync Token: ", this.settings.syncToken );
+
+		if (notify) {
+			new Notice('Fetching Tasks...');
+		}
+		else {
+			console.log('Fetching Tasks...');
+		}
+
+		let result:any = await axios.post(getSyncBaseUri() + 'sync',
+			{
+				sync_token: this.settings.syncToken,
+				resource_types: '["all"]'
+			},
+			{
+				headers: {
+					'Authorization': `Bearer ${this.settings.key}`,
+					'Content-Type': 'application/json'
+				}
+			}
+		);
+
+		console.log('Sync response:', result);
+
+		if (notify) {
+			new Notice('Writing Task files...');
+		}
+		else {
+			console.log('Writing Task files...');
+		}
+
+		const tasks:any = result.data.items;
+		for (let task of tasks) {
+			this.updateTask(task, projectMap[task.project_id], sectionMap[task.section_id]);
+		}
+
+		this.settings.syncToken = result.data.sync_token;
+		console.log('Sync Token: ', this.settings.syncToken);
+		this.saveSettings();
+	}
+
+
+	updateTask(task:Task, project?:Project, section?:Section) {
+
+		const fp:string = this.settings.directory + '/' + task.id + '.md';
+
+		if (task.is_deleted) {
+			this.app.vault.adapter.remove(normalizePath(fp));
+			return;
+		}
+
+		let metadata:any = {
+			link: `${DESKTOP_URL_PROTOCOL}://task?id=${task.id}`,
+			due: task.due?.date,
+			priority: task.priority,
+			project: project?.name,
+			section: section?.name,
+			recurrence: task.due?.string,
+			labels: task.labels.map((id) => id.toString()),
+			created: task.added_at,
+			completed: task.completed_at,
+		};
+
+		metadata[this.settings.titleFrontMatterKey] = task.content;
+
+		if (project && this.settings.projectDirectory !== '') {
+			metadata.projectLink = `[[/${this.settings.projectDirectory}/${project.name}/`;
+			if ( section ) {
+				metadata.projectLink += section.name + '/' + section.name + ']]';
+			}
+			else {
+				metadata.projectLink += project.name + ']]';
+			}
+		}
+
+		if (this.settings.fileClass !== '') {
+			metadata.class = this.settings.fileClass;
+		}
+
+
+		const yamlStr = yaml.dump(metadata);
+
+
+		const fileStr = `---\n${yamlStr}---\n${task.description}`;
+		let file = this.app.vault.adapter.write(normalizePath(fp), fileStr);
+
+		return file;
+	}
+
 
 	onunload() {
 
@@ -91,23 +362,8 @@ export default class MyPlugin extends Plugin {
 	}
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
-
-class SampleSettingTab extends PluginSettingTab {
+class OTDSSettingTab extends PluginSettingTab {
 	plugin: MyPlugin;
 
 	constructor(app: App, plugin: MyPlugin) {
@@ -121,14 +377,70 @@ class SampleSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
+			.setName('Todoist API Key')
+			.setDesc('<url>')
 			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
+				.setPlaceholder('Todoist API Key')
+				.setValue(this.plugin.settings.key)
 				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
+					this.plugin.settings.key = value;
 					await this.plugin.saveSettings();
 				}));
+
+		new Setting(containerEl)
+			.setName('Task Directory')
+			.setDesc('Directory synced tasks will reside.')
+			.addText(text => text
+				.setPlaceholder('Tasks')
+				.setValue(this.plugin.settings.directory)
+				.onChange(async (value) => {
+					this.plugin.settings.directory = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Project Directory')
+			.setDesc('Directory where project links will point.')
+			.addText(text => text
+				.setPlaceholder('Projects')
+				.setValue(this.plugin.settings.projectDirectory)
+				.onChange(async (value) => {
+					this.plugin.settings.projectDirectory = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Metadata File Class')
+			.setDesc('File class for use with Metadata Menu plugin.')
+			.addText(text => text
+				.setPlaceholder('todoist')
+				.setValue(this.plugin.settings.fileClass)
+				.onChange(async (value) => {
+					this.plugin.settings.fileClass = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Auto Sync Frequency')
+			.setDesc('Sync interval in seconds. 0 to disable.')
+			.addText(text => text
+				.setPlaceholder('0')
+				.setValue(this.plugin.settings.autoSyncFrequency.toString())
+				.onChange(async (value) => {
+					this.plugin.settings.autoSyncFrequency = parseFloat(value);
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Title Front Matter Key')
+			.setDesc('Front matter key to use for title. If using the "Front Matter Title" plugin, set this to match the key used there.')
+			.addText(text => text
+				.setPlaceholder('alias')
+				.setValue(this.plugin.settings.titleFrontMatterKey)
+				.onChange(async (value) => {
+					this.plugin.settings.titleFrontMatterKey = value;
+					await this.plugin.saveSettings();
+				}));
+
 	}
 }
