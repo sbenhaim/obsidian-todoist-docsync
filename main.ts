@@ -60,6 +60,7 @@ const DEFAULT_SETTINGS: OTDSSettings = {
 export default class MyPlugin extends Plugin {
 	settings: OTDSSettings;
 	api: any;
+	intervalId: number | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -73,13 +74,6 @@ export default class MyPlugin extends Plugin {
 				this.sync(true);
 			}
 		});
-
-		if (this.settings.autoSyncFrequency > 0) {
-			this.registerInterval(window.setInterval(() => {
-				this.sync();
-			}, this.settings.autoSyncFrequency * 1000));
-		}
-
 
 		this.addCommand({
 			id: 'otds-sync-all',
@@ -153,6 +147,25 @@ export default class MyPlugin extends Plugin {
 		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new OTDSSettingTab(this.app, this));
 
+
+		this.updateAutoSync();
+
+	}
+
+	updateAutoSync() {
+		if (this.intervalId) {
+			window.clearInterval(this.intervalId);
+			this.intervalId = null;
+		}
+
+		if (this.settings.autoSyncFrequency > 0) {
+			this.intervalId = this.registerInterval(window.setInterval(() => {
+				this.sync();
+			}, this.settings.autoSyncFrequency * 1000));
+		}
+		else {
+			this.intervalId = null;
+		}
 	}
 
 	async getProjects():Promise<Project[]> {
@@ -350,7 +363,10 @@ export default class MyPlugin extends Plugin {
 
 
 	onunload() {
-
+		if (this.intervalId) {
+			window.clearInterval(this.intervalId);
+			this.intervalId = null;
+		}
 	}
 
 	async loadSettings() {
@@ -429,6 +445,7 @@ class OTDSSettingTab extends PluginSettingTab {
 				.onChange(async (value) => {
 					this.plugin.settings.autoSyncFrequency = parseFloat(value);
 					await this.plugin.saveSettings();
+					this.plugin.updateAutoSync();
 				}));
 
 		new Setting(containerEl)
